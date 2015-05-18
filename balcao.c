@@ -37,6 +37,7 @@
 int timeIsOpen;
 int numberBalcao;
 int *pt;
+pthread_mutex_t mut=PTHREAD_MUTEX_INITIALIZER; 
 
 /*function given in the slides*/
 int readline(int fd, char *str)
@@ -54,6 +55,7 @@ int readline(int fd, char *str)
 	arg é o pathname do FIFO do cliente
 */
 	void *clienteAtendimento(void * arg){
+		pthread_mutex_unlock(&mut);
 		int waitingTime = pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 4] + 1;
 		if(waitingTime > 10)
 			waitingTime = 10;
@@ -64,6 +66,7 @@ int readline(int fd, char *str)
 		pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 5]++;
 		pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 6] = 123; /*estas contas vão ser bonitas vão -.-*/
 		pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 4]--;
+		pthread_mutex_unlock(&mut);
 		return 0;
 	}
 
@@ -83,7 +86,6 @@ int readline(int fd, char *str)
 			fprintf(stderr, "Entrou no readline ->%s\n",clientFIFOID);
 			pthread_t tid;
 			pthread_create(&tid,NULL,clienteAtendimento,clientFIFOID);
-			pthread_join(tid,NULL); // apagado quando o mutexe for feito
 		}
 		fprintf(stderr,"Saiu do readline");
 		return;
