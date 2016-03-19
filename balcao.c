@@ -1,147 +1,171 @@
-#include <stdio.h> 
-#include <unistd.h> 
-#include <sys/stat.h> 
-#include <sys/types.h> 
-#include <dirent.h> 
-#include <errno.h> 
-#include <string.h> 
-#include <sys/wait.h>
-#include <string.h>
-#include <limits.h>
-#include <stdlib.h>
-#include <libgen.h>
-#include <time.h>
-#include <sys/ipc.h>
-#include <sys/shm.h>
-#include <sys/mman.h>
-#include <pthread.h>
-#include <fcntl.h>
-#include <signal.h>
 
-#define DEFAULT_STRING_SIZE 200
-#define PROJ_ID 'a'
-#define FIMDEATENDIMENTO "fim_atendimento"
-#define FIMDEATENDIMENTOSIZE 15
+#include "logger.h"
 
-//Shared Memory index
-
-#define OPENINGTIME 0
-#define NUMOFBALCOES 1
-#define NUMOFOPENBALCOES 2
-#define NUMOFACTIVEBALCOES 3
-#define NUMOFCLIENTSSORTING 4
-#define BALCAODEFINING 5
-#define NUMOFBALCAOVARIABLES 7
-
-//global variables
-int timeIsOpen;
-int numberBalcao;
-int *pt;
-pthread_mutex_t mut=PTHREAD_MUTEX_INITIALIZER; 
-
-/*function given in the slides*/
+/*function given in the slides
+altered to work with this project
+*/
 int readline(int fd, char *str)
 {
+	char* ptr = str;
 	int n;
 	do
 	{
 		while((n = read(fd,str,1)) == 0);
+			//fprintf(stderr, "->%s\n",str);
 	}
 	while (n>0 && *str++ != '\0');
-	return strlen(str);
+	return strlen(ptr);
 }
 /*
-	Thread de Atendimento dos Clientes
-	arg é o pathname do FIFO do cliente
+	Client Serving Thread
+	arg arg is the pathname* of the clientFIFO
 */
-	void *clienteAtendimento(void * arg){
-		pthread_mutex_unlock(&mut);
-		int waitingTime = pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 4] + 1;
+	void *clientServing(void * arg){
+
+		//calculate the waiting Time
+		struct atendimentoData *atendimento = (struct atendimentoData *) arg;
+		int waitingTime = atendimento->argStruct->clientOnLine;
+		waitingTime++;
 		if(waitingTime > 10)
 			waitingTime = 10;
+
+		atendimento->argStruct->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(atendimento->argStruct->numberBalcao-1) + 6] += waitingTime;
+		atendimento->argStruct->clientOnLine++;
+
+		writeLOG(atendimento->argStruct->shmemName,time(NULL),BALCAO,atendimento->argStruct->numberBalcao,BALCAOSTARTSSERVICE,atendimento->clientFIFOID);
 		sleep(waitingTime);
-		int fdCliente = open(arg,O_WRONLY);
+
+		//semaphore is used to sync the input on the shm
+		sem_wait(atendimento->argStruct->sem);
+
+		int fdCliente = open(atendimento->clientFIFOID,O_WRONLY);
+		if(fdCliente<0)
+			fprintf(stderr, "Erro ao Executar Open ao Fifo do Cliente -> %s\n", strerror(errno));
 		write(fdCliente,FIMDEATENDIMENTO,FIMDEATENDIMENTOSIZE+1);
 		close(fdCliente);
-		pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 5]++;
-		pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 6] = 123; /*estas contas vão ser bonitas vão -.-*/
-		pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 4]--;
-		pthread_mutex_unlock(&mut);
+		atendimento->argStruct->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(atendimento->argStruct->numberBalcao-1) + 5]++;
+		atendimento->argStruct->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(atendimento->argStruct->numberBalcao-1) + 4]--;
+		writeLOG(atendimento->argStruct->shmemName,time(NULL),BALCAO,atendimento->argStruct->numberBalcao,BALCAOSTOPSSERVICE,atendimento->clientFIFOID);
+		sem_post(atendimento->argStruct->sem);
+		free(atendimento);
 		return 0;
 	}
 
-	void balcaoManagement(){
+	void balcaoManagement(struct balcaoData *arg){
+
 		char privateFIFOPathname[DEFAULT_STRING_SIZE], clientFIFOID[DEFAULT_STRING_SIZE];
-		sprintf(privateFIFOPathname,"/tmp/fb_%i",pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 3]);
-
+		sprintf(privateFIFOPathname,"/tmp/fb_%i",arg->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(arg->numberBalcao-1) + 3]);
+		
 		int fd = open(privateFIFOPathname,O_RDONLY);
-
-		fprintf(stderr,"Passou o bloqueio!!\n");
 
 		if(fd < 0){
 			fprintf(stderr,"Erro ao abrir o FIFO do Balcao -> %s\n",strerror(errno));
 		}
-
 		while(readline(fd,clientFIFOID) > 0){
-			fprintf(stderr, "Entrou no readline ->%s\n",clientFIFOID);
+
+			struct atendimentoData *atendimento = malloc(sizeof(struct atendimentoData));
+			atendimento->argStruct = arg;
+
+			arg->pt[NUMBEROFCLIENTS]--;
+
+
+			
+			strcpy(atendimento->clientFIFOID, clientFIFOID);
+			
 			pthread_t tid;
-			pthread_create(&tid,NULL,clienteAtendimento,clientFIFOID);
+			pthread_create(&tid,NULL,clientServing,atendimento);
 		}
-		fprintf(stderr,"Saiu do readline");
-		return;
+		fprintf(stderr,"Saiu do readline");// This is never going to run, since the while is broken by the signal
+		return;	
 	}
 
 
 	void *cycle_function(void *arg){
 
+		struct balcaoData *argStruct;
+
+		argStruct = (struct balcaoData *) arg;
 
 		time_t openingTime = time(NULL);
-		time_t current_time = openingTime;
 
-		key_t key = ftok((char *)arg,PROJ_ID);
-		int shmid = shmget(key,1024,0);
+		int shmfd = shm_open(argStruct->shmemName,O_RDWR,0600); 
 
+		char semName[DEFAULT_STRING_SIZE];
 
-		if(shmid == -1){
-		/*no caso de não ter sido criado a memória partilhada*/
-		shmid = shmget(key,1024,IPC_CREAT|SHM_R|SHM_W);//tamanho aleatorio
+		sprintf(semName,"/%s",argStruct->shmemName);
+
+		if(shmfd == -1){
+		/*Create shm if its the first balcao*/
+			shmfd = shm_open(argStruct->shmemName,O_CREAT|O_RDWR,0600);
+
+			if (ftruncate(shmfd,SHM_SIZE) < 0)
+			{
+				fprintf(stderr, "Erro ao executar truncate da SHM -> %s\n", strerror(errno));
+				exit(3);
+			};
 
 		/*create pointer to shared memory*/
-		pt = (int *)shmat(shmid,0,0);
-		/*defining the shared memory variables*/
-		pt[OPENINGTIME] = openingTime;
-		pt[NUMOFBALCOES] = 0;
-		pt[NUMOFOPENBALCOES] = 0;
-		pt[NUMOFACTIVEBALCOES] = 0;
-		pt[NUMOFCLIENTSSORTING] = 0;
-	}
-	else pt = (int *)shmat(shmid,0,0); /*create pointer to shared memory*/
-	
+			argStruct->pt = (int *) mmap(0,SHM_SIZE,PROT_READ|PROT_WRITE,MAP_SHARED,shmfd,0);
+			if(argStruct->pt == MAP_FAILED)
+			{
+				fprintf(stderr, "Erro ao executar o mapeamento da SHM -> %s\n", strerror(errno));
+				exit(4);
+			} 
+
+			argStruct->sem = sem_open(semName,O_CREAT,0600,1);
+			if(argStruct->sem == SEM_FAILED)
+			{
+				perror("WRITER failure in sem_open()");
+				exit(5);
+			} 
+
+			//initiate the global variables of the shm
+			writeLOG(argStruct->shmemName,openingTime,BALCAO,1,SHMEMINIT,"-");
+			argStruct->pt[OPENINGTIME] = openingTime;
+			argStruct->pt[NUMOFBALCOES] = 0;
+			argStruct->pt[NUMOFOPENBALCOES] = 0;
+			argStruct->pt[NUMOFACTIVEBALCOES] = 0;
+			argStruct->pt[NUMBEROFCLIENTS] = 0;
+		}
+		else {
+			argStruct->pt = (int *) mmap(0,SHM_SIZE,PROT_READ|PROT_WRITE,MAP_SHARED,shmfd,0); /*create pointer to shared memory*/
+			argStruct->sem = sem_open(semName,0,0600,1);
+			if(argStruct->sem == SEM_FAILED)
+			{
+				perror("WRITER failure in sem_open()");
+				exit(6);
+			}
+		}
+
+
 	//Update of some variables
-	pt[NUMOFBALCOES] = pt[NUMOFBALCOES] + 1;
-	numberBalcao = pt[NUMOFBALCOES];
-	pt[NUMOFOPENBALCOES]++;
-	pt[NUMOFACTIVEBALCOES]++;
-	fprintf(stderr,"Open Balcoes = %i\n",pt[NUMOFOPENBALCOES]);
-	fprintf(stderr,"Active Balcoes = %i\n",pt[NUMOFACTIVEBALCOES]);
+		argStruct->pt[NUMOFBALCOES] = argStruct->pt[NUMOFBALCOES] + 1;
+		argStruct->numberBalcao = argStruct->pt[NUMOFBALCOES];
+		argStruct->pt[NUMOFOPENBALCOES]++;
+		argStruct->pt[NUMOFACTIVEBALCOES]++;
+		fprintf(stderr,"Open Balcoes = %i\n",argStruct->pt[NUMOFOPENBALCOES]);
+		fprintf(stderr,"Active Balcoes = %i\n",argStruct->pt[NUMOFACTIVEBALCOES]);
 
 	/* creating balcao FIFO*/
-	char privateFIFOPathname[DEFAULT_STRING_SIZE];
-	int currentPID = getpid();
-	sprintf(privateFIFOPathname,"/tmp/fb_%i",currentPID);
-	if(mkfifo(privateFIFOPathname,0660) < 0){
-		printf("Erro ao criar o fifo do Balcao\n");
-		return 0;
-	}
+		char privateFIFOPathname[DEFAULT_STRING_SIZE], privateFIFOID[DEFAULT_STRING_SIZE];
+		int currentPID = getpid();
+		sprintf(privateFIFOPathname,"/tmp/fb_%i",currentPID);
+		sprintf(privateFIFOID,"fb_%i",currentPID);
+		if(mkfifo(privateFIFOPathname,0660) < 0){
+			printf("Erro ao criar o fifo do Balcao\n");
+			exit(7);
+		}
+		writeLOG(argStruct->shmemName,time(NULL),BALCAO,argStruct->numberBalcao,BALCAOFIFOCREATION,privateFIFOID);
+
 
 	//create variables for this balcao
-	pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1)] = pt[NUMOFBALCOES];
-	pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 1] = openingTime;
-	pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 2] = -1; // tempo de abertura
-	pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 3] = currentPID;
-	pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 4] = 0; // clientes em espera
-	pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 5] = 0; // clientes atendidos
-	pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 6] = 0; // tempo medio de atendimento
+	argStruct->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(argStruct->numberBalcao-1)] = argStruct->pt[NUMOFBALCOES];
+	argStruct->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(argStruct->numberBalcao-1) + 1] = openingTime;
+	argStruct->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(argStruct->numberBalcao-1) + 2] = -1; // tempo de abertura
+	argStruct->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(argStruct->numberBalcao-1) + 3] = currentPID;
+	argStruct->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(argStruct->numberBalcao-1) + 4] = 0; // clientes em espera
+	argStruct->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(argStruct->numberBalcao-1) + 5] = 0; // clientes atendidos
+	argStruct->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(argStruct->numberBalcao-1) + 6] = 0; // tempo total de atendimento
 
 	/*main thread calling*/
 	pid_t pid;
@@ -149,45 +173,71 @@ int readline(int fd, char *str)
 
 	if(pid == 0)
 	{
-		balcaoManagement();
-		return 0;
+		balcaoManagement(argStruct);
+		exit(0);
 	}
 	else if(pid > 0)
 	{
-	/*cycling through time to close balcao
-	Bloqueia este processo*/
-		while(difftime(current_time,openingTime) < timeIsOpen)
-			current_time = time(NULL);
+	/*Sleeping the inserted time
+	Blocks the process*/
+		sleep(argStruct->timeIsOpen);
 
-		/*closing the balcao to the customers, but balcao still working if needed*/
-		pt[NUMOFOPENBALCOES]--;
-		fprintf(stderr,"Open Balcoes = %i\n",pt[NUMOFOPENBALCOES]);
+		writeLOG(argStruct->shmemName,time(NULL),BALCAO,argStruct->numberBalcao,CLOSEBALCAO,"-");
 
-		pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 2] = timeIsOpen;
+	/*closing the balcao to the customers, but balcao still working if needed*/
+		argStruct->pt[NUMOFOPENBALCOES]--;
+		fprintf(stderr,"Open Balcoes = %i\n",argStruct->pt[NUMOFOPENBALCOES]);
+		while(argStruct->pt[NUMBEROFCLIENTS] != 0);
+		argStruct->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(argStruct->numberBalcao-1) + 2] = argStruct->timeIsOpen;
 
-	/*Ciclo para confirmar se existem clientes em fila ou não
-	Bloqueia novamente este pocesso
+	/*Cycle that checks if the balcao still has clients in line.
+	Blocks the process again
 	*/
-	while(pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(numberBalcao-1) + 4] != 0);
-	/*Quando não houver enviar sinal para parar a espera bloqueante*/
+	
+	while(argStruct->pt[BALCAODEFINING + NUMOFBALCAOVARIABLES*(argStruct->numberBalcao-1) + 4] != 0);
+	/*When there is no more clients a signal is send to stop the blocked FIFO*/
 	kill(pid,SIGKILL);
 
-	int status;
-	waitpid(pid,&status,0);
-
-	pt[NUMOFACTIVEBALCOES]--;
-	fprintf(stderr,"Active Balcoes = %i\n",pt[NUMOFACTIVEBALCOES]);
+	argStruct->pt[NUMOFACTIVEBALCOES]--;
+	fprintf(stderr,"Active Balcoes = %i\n",argStruct->pt[NUMOFACTIVEBALCOES]);
 	unlink(privateFIFOPathname);
 
-	/*apagar a memoria partilhado no caso de ser o ultimo balcao*/
-	if(pt[NUMOFACTIVEBALCOES] == 0)
-		shmctl(shmid,IPC_RMID,NULL);//temporario
-	return 0;
+	writeLOG(argStruct->shmemName,time(NULL),BALCAO,argStruct->numberBalcao,BALCAOSTOPSSERVING,"-");
+
+	/*Delete the shared memory if its the last balcao*/
+	if(argStruct->pt[NUMOFACTIVEBALCOES] == 0){
+		writeLOG(argStruct->shmemName,time(NULL),BALCAO,argStruct->numberBalcao,STORECLOSE,"-");
+		writeSHM(argStruct->pt);
+
+		sem_close(argStruct->sem);
+		sem_unlink(semName); 
+
+		if (munmap(argStruct->pt,SHM_SIZE) < 0)
+		{
+			fprintf(stderr, "Erro ao executar o desmapeamento da SHM -> %s\n", strerror(errno));
+			exit(8);
+		} 
+		if (shm_unlink(argStruct->shmemName) < 0)
+		{
+			fprintf(stderr, "Erro ao executar o unlink da SHM -> %s\n", strerror(errno));
+			exit(9);
+		} 
+	}else{
+		if (munmap(argStruct->pt,SHM_SIZE) < 0)
+		{
+			fprintf(stderr, "Erro ao executar o desmapeamento da SHM -> %s\n", strerror(errno));
+			exit(10);
+		}
+	}
+	free((void *)argStruct->pt[BALCAODEFINING]);
+	free(argStruct);
+	exit(0);
 }
 else{
 	fprintf(stderr,"Erro a criar o Fork -> %s\n",strerror(errno));
+	exit(11);
 }
-return 0;
+exit(0);
 }
 /*
 	Main function.
@@ -195,18 +245,35 @@ return 0;
 */
 	int main(int argc, char *argv[])
 	{
-	//argv[1] = nome da memória partilhada
-	//argv[2] = tempo de abertura do balcao
+	//argv[1] = name of the shm
+	//argv[2] = time the balcao will be open
 	/*
-		confirmação da existencia de memoria partilhada
+		check if shared memory exists
 	*/
-		timeIsOpen = atoi(argv[2]);
 
-		pthread_t tid;
-
-		if(fork() == 0){
-			pthread_create(&tid,NULL,cycle_function,argv[1]);
+		if (argc != 3){
+			fprintf( stderr, "Usage: %s <memoriaPartilhada> <tempoAbertura>\n", argv[0]);
+			exit(1);
 		}
-	//shmctl(shmid,IPC_RMID,NULL);
+
+		struct balcaoData *argStruct = malloc(sizeof(struct balcaoData));
+		argStruct->timeIsOpen = atoi(argv[2]);
+		argStruct->shmemName = argv[1];
+		argStruct->clientOnLine = 0;
+
+		if(argStruct->timeIsOpen <= 0)
+		{
+			fprintf(stderr, "Erro na passagem do tempo de abertura\n");
+			exit(1);
+		}
+		pid_t pid;
+		pthread_t tid;
+		if((pid = fork()) == 0){
+			pthread_create(&tid,NULL,cycle_function,argStruct);
+		}
+		else if(pid < 0){
+			fprintf(stderr, "Erro ao Fork -> %s\n", strerror(errno));
+			exit(2);
+		}
 		pthread_exit(NULL);
 	}

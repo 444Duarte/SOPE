@@ -1,0 +1,9 @@
+Tempo de Abertura da Loja -> 1432759308
+Numero de Balcoes Abertos -> 3
+Balcao |     Abertura    |   Nome   |          Num_clientes         | Tempo_medio
+ #     | Tempo | Duracao |   FIFO   | em_atendimento | ja_atendidos | atendimento
+1      |1432759308|30       |fb_2909   |0               |303             |9.851485
+2      |1432759312|30       |fb_3814   |0               |297             |9.848485
+3      |1432759316|30       |fb_4720   |0               |0               |0           
+
+Tempo Medio Global : 9.850000
